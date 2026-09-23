@@ -1,7 +1,8 @@
 # VLM 学习项目说明（新手快速上手指南）
 
 > 本项目是一套用**最小可运行代码**演示「视觉 / 视觉-语言模型」经典方法的**教学示例**，
-> 覆盖两大主题：**自监督预训练**（CLIP / DINO / MAE / MoCo）与**参数高效微调**（Adapter / Linear Probing / Prompt Tuning）。
+> 覆盖三大主题：**自监督预训练**（CLIP / DINO / MAE / MoCo）、**参数高效微调**（Adapter / Linear Probing / Prompt Tuning）
+> 与**图像生成模型**（VAE / DDPM）。
 >
 > 每个 `.py` 文件都是一个**独立**的方法示例，可以单独运行，彼此之间没有依赖关系。
 > 所有代码都已加上详细中文注释，配合本文档阅读即可快速理解。
@@ -20,6 +21,9 @@
 2. **微调 / 下游适配（Fine-tuning）**：把预训练好的模型用到具体任务（如图像分类）上。
    - 对应文件：`linear-probing.py`、`adapter.py`、`prompt-tuning.py`
    - 关键词：**冻结大部分参数，只训练很少一部分**，省算力、防过拟合。
+3. **图像生成（Generation）**：让模型学会数据分布，从而「凭空生成」新图片。
+   - 对应文件：`vae.py`（变分自编码器）、`ddpm.py`（去噪扩散模型）
+   - 关键词：**从噪声 / 潜在向量还原出图片**，是当今 AI 绘画（Stable Diffusion 等）的核心。
 
 ---
 
@@ -34,10 +38,13 @@ vlm/
 ├── adapter.py           # 微调方法：冻结 ViT，在每个 Block 插入小型 Adapter
 ├── linear-probing.py    # 微调方法：冻结 ViT，只训练一个线性分类头（对比全量微调）
 ├── prompt-tuning.py     # 微调方法：冻结 ViT，只训练插入的「提示 token」
+├── vae.py               # 生成模型：变分自编码器，编码器压成分布→解码器重建/生成（含完整训练）
+├── ddpm.py              # 生成模型：去噪扩散模型，前向加噪+反向去噪，UNet 预测噪声（含完整训练）
 └── README.md            # 本说明文档
 ```
 
 > 运行时会自动在项目目录下生成 `./cifar10/`（数据集）；`CLIP.py` 还需要你提前把 BERT 模型放到 `./bert-base-uncased/`。
+> `vae.py` / `ddpm.py` 使用 **CelebA 人脸数据集**，需自行把图片放到各自文件顶部 `data_root` 指定的目录（详见下文第六节）。
 
 ---
 
@@ -205,6 +212,54 @@ x = 原MLP输出 + Adapter输出   # Adapter 只学一个「修正量」
 
 ---
 
+### 8. `vae.py` —— 变分自编码器（图像生成，含完整训练）
+
+**要解决的问题**：让模型学会人脸图片的分布，从而既能**重建**原图，又能**凭空生成**新人脸。
+
+**核心思想：编码成「分布」而不是「点」**
+- `Encoder`：把图片压缩成潜在分布的参数——均值 `mu` 和对数方差 `logvar`
+- `reparameterize`（重参数化技巧）：`z = mu + eps*std`，把「随机采样」这个不可导操作改写成可导形式
+- `Decoder`：从潜在向量 `z` 还原出图片（输出经 Sigmoid，落在 `[0,1]`）
+
+**损失函数（`vae_loss`）= 重建损失 + KL 散度**：
+```
+recon：重建图 vs 原图的 MSE —— 保证「还原得像」
+kld  ：约束分布接近标准正态 N(0,1) —— 保证「潜在空间规整、可采样生成」
+```
+
+**生成新图**：直接从 `N(0,1)` 随机采一个 `z`，喂给 `model.decode(z)` 即可。
+
+**运行**：`python vae.py`（需先把 CelebA 图片放到 `data_root`，见第六节）
+
+---
+
+### 9. `ddpm.py` —— 去噪扩散模型（图像生成，含完整训练）
+
+**要解决的问题**：当前最主流的图像生成方法（Stable Diffusion / DALL·E 的核心）。
+
+**核心思想：两个方向相反的过程**
+- **前向加噪 `q_sample`**：把真实图片分 `T=1000` 步逐渐加噪声，直到变成纯高斯噪声（固定公式，不学习）
+- **反向去噪 `p_sample`**：训练一个 UNet 学会「去掉一点噪声」；生成时从纯噪声出发，反复去噪 `T` 次得到新图
+
+**训练目标（关键）**：不是直接预测干净图片，而是**预测加进去的噪声 `eps`**（`p_losses` 里用 MSE 对比）。
+
+**关键零件**：
+| 零件 | 作用 |
+|------|------|
+| `linear_beta_schedule` | 定义每步加多少噪声（beta 逐渐变大） |
+| `alpha_cumprod` | 累乘系数，一步直接算出任意时刻 t 的加噪结果 |
+| `SinusoidalPosEmb` | 把时间步 t 编码成向量，告诉 UNet「现在噪声多严重」 |
+| `EnhancedUNet` | 带残差块 + 自注意力的去噪网络，U 形结构 + skip 跳跃连接 |
+
+**采样生成**：`sample_loop` 从纯噪声开始，`for t in reversed(range(T))` 逐步调用 `p_sample` 去噪。
+
+> 💡 `ddpm.py` 还额外提供了 `merge_models`（合并多个 checkpoint，支持平均 / EMA）
+> 和 `generate_images_with_merged_model`（用合并模型批量出图）两个实用工具函数。
+
+**运行**：`python ddpm.py`（需先准备 CelebA 数据集；UNet 较大，建议在 GPU 上运行，显存不足可调小 `batch_size`）
+
+---
+
 ## 五、方法总览（一张表看懂区别）
 
 | 文件 | 方法 | 阶段 | 是否用标签 | 训练什么 |
@@ -216,10 +271,13 @@ x = 原MLP输出 + Adapter输出   # Adapter 只学一个「修正量」
 | `linear-probing.py` | 线性探测/微调 | 下游 | ✅ 有 | 只训分类头 / 或全部 |
 | `adapter.py` | 适配器 | 下游 | ✅ 有 | 小型 Adapter + 分类头 |
 | `prompt-tuning.py` | 提示微调 | 下游 | ✅ 有 | 提示 token + 分类头 |
+| `vae.py` | 变分自编码器 | 生成 | ❌ 无 | 编码器 + 解码器 |
+| `ddpm.py` | 去噪扩散 | 生成 | ❌ 无 | 去噪 UNet |
 
 **记忆口诀**：
 - 预训练四兄弟：**CLIP 对齐图文，DINO 师生蒸馏，MAE 遮图重建，MoCo 队列对比**。
 - 微调三兄弟：**Linear 只换头，Adapter 插小瓶，Prompt 加提示**（都是「冻结主干，只训一点点」）。
+- 生成两兄弟：**VAE 压成分布再解码，DDPM 加噪去噪逐步雕**（都是「从噪声/潜在向量还原出图」）。
 
 ---
 
@@ -227,15 +285,17 @@ x = 原MLP输出 + Adapter输出   # Adapter 只学一个「修正量」
 
 ### 1. 依赖库
 ```bash
-pip install torch torchvision timm transformers numpy
+pip install torch torchvision timm transformers numpy pillow
 ```
+> `pillow`（即 `PIL`）是 `vae.py` / `ddpm.py` 读取图片所需；其余文件不依赖它。
 
 ### 2. 数据集
-CIFAR10 会在首次运行时**自动下载**到 `./cifar10/`（需要联网）。
+- **CIFAR10**（分类 / 自监督类文件使用）：会在首次运行时**自动下载**到 `./cifar10/`（需要联网）。
+- **CelebA 人脸**（`vae.py` / `ddpm.py` 使用）：需**自行准备**，把一批 `.jpg` 图片放到两个文件顶部 `data_root` 变量指定的目录（默认 `/mnt/d/data/face/img/img_align_celeba`，可改成你自己的路径）。
 
 ### 3. CLIP 额外准备
 `CLIP.py` 需要本地 BERT 模型，放到 `./bert-base-uncased/` 目录（含 `config.json`、权重、词表等）。
-若暂时没有，可先运行其它 6 个文件。
+若暂时没有，可先运行其它文件。
 
 ### 4. 运行任意示例
 ```bash
@@ -246,13 +306,17 @@ python linear-probing.py
 python adapter.py
 python prompt-tuning.py
 python CLIP.py           # 需准备好 BERT
+python vae.py            # 需准备好 CelebA，会训练并生成人脸样本
+python ddpm.py           # 需准备好 CelebA，建议在 GPU 上运行（较慢）
 ```
 
 ### 5. 关于「运行结果」的重要说明
-> 这些文件是**教学演示**，主要展示**前向传播 + 损失计算**的完整逻辑。
+> 前 7 个文件（预训练 / 微调）是**教学演示**，主要展示**前向传播 + 损失计算**的完整逻辑。
 > - `MAE.py` / `linear-probing.py` / `adapter.py` / `prompt-tuning.py` / `CLIP.py`：
 >   会遍历数据集打印 loss，但**部分没有写完整的反向传播训练循环**（DINO、MoCo 有完整训练循环）。
-> - 首次运行会**下载预训练权重和数据集**，需要联网且耗时较长；ViT/BERT 对显存有一定要求，
+> - `vae.py` / `ddpm.py`：是**含完整训练循环**的生成模型示例，会真正反向传播、保存权重，
+>   并在 `save_dir` 目录下输出生成 / 重建的样本图片（`ddpm.py` 还支持断点续训）。
+> - 首次运行会**下载预训练权重和数据集**，需要联网且耗时较长；ViT/BERT/UNet 对显存有一定要求，
 >   如果显存不足，可把 `batch_size` 调小。
 
 ---
@@ -263,8 +327,10 @@ python CLIP.py           # 需准备好 BERT
 2. **理解微调三兄弟**：`linear-probing.py` → `adapter.py` → `prompt-tuning.py`，
    重点体会「冻结主干 + 只训练少量参数」这个共同思想。
 3. **再看自监督预训练**：`moco.py`（对比学习）→ `DINO.py`（师生蒸馏）→ `CLIP.py`（图文对齐）。
-4. **对照注释读代码**：每个文件顶部都有「核心思想（小白版）」的文档字符串，先读它再看 `forward`。
-5. **动手改**：试着改 `batch_size`、`mask_ratio`、`mode='shallow'/'deep'` 等参数，观察输出变化。
+4. **最后学生成模型**：先看 `vae.py`（理解「编码成分布 → 解码生成」），再看 `ddpm.py`
+   （理解「前向加噪 → 反向去噪」，这是 Stable Diffusion 的基础）。
+5. **对照注释读代码**：每个文件顶部都有「核心思想（小白版）」的文档字符串，先读它再看 `forward`。
+6. **动手改**：试着改 `batch_size`、`mask_ratio`、`mode='shallow'/'deep'`、`latent_dim`、`T` 等参数，观察输出变化。
 
 ---
 
@@ -282,3 +348,15 @@ A：见上文「新手避坑」——当前用的是普通 list，参数未被�
 
 **Q：显存不够 / 太慢？**
 A：调小 `batch_size`；ViT-small + CIFAR10 已是最小配置，若仍吃力可只跑 `MAE.py`（可用随机张量，无需真实数据）。
+
+**Q：跑 `vae.py` / `ddpm.py` 报错找不到图片 / 数据集为空？**
+A：这两个文件用的是 **CelebA 人脸数据集**，不会自动下载。需你把 `.jpg` 图片放到文件顶部 `data_root`
+指定的目录（默认 `/mnt/d/data/face/img/img_align_celeba`），或直接改成你自己的图片目录。
+
+**Q：`ddpm.py` 生成要跑 1000 步，太慢怎么办？**
+A：DDPM 采样确实需要逐步去噪 `T=1000` 次，较慢。学习阶段可先把顶部 `T` 调小（如 `T=200`）、
+`image_size` 调小，并在 GPU 上运行（会自动启用 AMP 混合精度提速）；真正训练出好效果需要较长时间。
+
+**Q：VAE 和 DDPM 都是生成模型，它们有什么区别？**
+A：VAE 把图片压成一个「潜在分布」，一次解码就能出图，速度快但细节略模糊；
+DDPM 通过「反复加噪 / 去噪」生成，质量更高、细节更好，但采样慢（需多步），是目前 AI 绘画的主流方案。
